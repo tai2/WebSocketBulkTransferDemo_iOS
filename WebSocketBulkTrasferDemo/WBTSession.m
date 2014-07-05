@@ -13,7 +13,7 @@
 #define USE_PERSISTENT_CONNECTION YES
 #define SEND_BUFFER_SIZE (1024 * 1024)
 
-//#define ENABLE_LOG
+#define ENABLE_LOG
 
 #ifdef ENABLE_LOG
 #define DEBUG_LOG(...) NSLog(__VA_ARGS__)
