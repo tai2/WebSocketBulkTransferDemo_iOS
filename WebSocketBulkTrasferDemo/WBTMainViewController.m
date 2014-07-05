@@ -31,9 +31,7 @@ static void onAccept(CFSocketRef s, CFSocketCallBackType type, CFDataRef address
  
     self.sessions = [[NSMutableArray alloc] init];
     
-    NSString *dir_path = [[NSBundle mainBundle] pathForResource:@"html" ofType:nil];
-    NSString *html_path = [dir_path stringByAppendingPathComponent:@"index.html"];
-    NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL fileURLWithPath:html_path]];
+    NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:@"http://localhost:8080/index.html"]];
     [self.webview loadRequest:req];
 }
 

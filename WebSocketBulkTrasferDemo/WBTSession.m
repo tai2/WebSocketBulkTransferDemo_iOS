@@ -7,10 +7,10 @@
 //
 
 #import "WBTSession.h"
-#include "sys/socket.h"
+#include <sys/socket.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #define CHUNK_SIZE (128 * 1024)
-#define USE_PERSISTENT_CONNECTION YES
 #define SEND_BUFFER_SIZE (1024 * 1024)
 
 #define ENABLE_LOG
@@ -20,6 +20,8 @@
 #else
 #define DEBUG_LOG(...)
 #endif
+
+#define MAGIC_STRING @"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 @interface WBTSession ()<NSStreamDelegate>
 
@@ -32,6 +34,10 @@
 @property (retain, nonatomic) NSMutableArray *writeBuffers;
 @property (assign, nonatomic) NSInteger writePos;
 @property (assign, nonatomic) BOOL doClose;
+@property (assign, nonatomic) BOOL requestLineReceived;
+@property (retain, nonatomic) NSString *webSocketKey;
+@property (retain, nonatomic) NSString *path;
+@property (assign, nonatomic) BOOL isWebSocket;
 
 @end
 
@@ -74,7 +80,7 @@
     session.writePos = 0;
     session.writeBuffers = [NSMutableArray array];
     session.doClose = NO;
-    
+
     session.inputStream = inputStream;
     session.inputStream.delegate = self;
     [session.inputStream scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
@@ -84,6 +90,11 @@
     session.outputStream.delegate = self;
     [session.outputStream scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
     [session.outputStream open];
+    
+    session.requestLineReceived = NO;
+    session.isWebSocket = NO;
+    session.path = nil;
+    session.webSocketKey = nil;
     
     return session;
 }
@@ -185,8 +196,11 @@
                     [self dispatchLine:line];
                     self.linePos = 0;
                 } else {
-                    NSMutableData *body = [NSMutableData dataWithLength:CHUNK_SIZE];
-                    [self sendResponse:body];
+                    if (self.isWebSocket) {
+                        [self sendWebSocketResponse];
+                    } else {
+                        [self sendFileResponse];
+                    }
                 }
                 break;
             }
@@ -206,7 +220,28 @@
 
 - (void)dispatchLine:(NSString *)line
 {
-    DEBUG_LOG(@"%@", line);
+    if (self.requestLineReceived) {
+        NSError *error = NULL;
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(\\S+?):\\s*(\\S+)"
+                                                                               options:0
+                                                                                 error:&error];
+        NSTextCheckingResult *result = [regex firstMatchInString:line options:0 range:NSMakeRange(0, [line length])];
+        if (result) {
+            NSString *key = [[line substringWithRange:[result rangeAtIndex:1]] lowercaseString];
+            NSString *value = [line substringWithRange:[result rangeAtIndex:2]];
+            DEBUG_LOG(@"%@: %@", key, value);
+            if ([key isEqualToString:@"sec-websocket-key"]) {
+                self.webSocketKey = value;
+            } else if ([key isEqualToString:@"upgrade"] && [value isEqualToString:@"websocket"]) {
+                self.isWebSocket = YES;
+            }
+        }
+    } else {
+        DEBUG_LOG(@"%@", line);
+        NSArray *parts = [line componentsSeparatedByString:@" "];
+        self.path = parts[1];
+        self.requestLineReceived = YES;
+    }
 }
 
 - (void)flush
@@ -242,22 +277,56 @@
     }
 }
 
-- (void)sendResponse:(NSData *)data
+- (void)sendFileResponse
 {
-    DEBUG_LOG(@"sendResponse");
+    DEBUG_LOG(@"sendFileResponse");
+    
+    NSString *dir_path = [[NSBundle mainBundle] pathForResource:@"html" ofType:nil];
+    NSString *file_path = [dir_path stringByAppendingPathComponent:self.path];
+    
+    if ([[NSFileManager defaultManager] fileExistsAtPath:file_path]) {
+        NSData *data = [NSData dataWithContentsOfFile:file_path];
+        NSMutableString *response = [NSMutableString string];
+        [response appendString:@"HTTP/1.1 200 OK\r\n"];
+        [response appendString:@"Connection: close\r\n"];
+        [response appendFormat:@"Content-Length: %lu\r\n", (unsigned long)data.length];
+        [response appendString:@"\r\n"];
+        [self.writeBuffers addObject:[response dataUsingEncoding:NSASCIIStringEncoding]];
+        [self.writeBuffers addObject:data];
+    } else {
+        NSMutableString *response = [NSMutableString string];
+        [response appendString:@"HTTP/1.1 404 Not Found\r\n"];
+        [response appendString:@"Connection: close\r\n"];
+        [response appendFormat:@"Content-Length: 0\r\n"];
+        [response appendString:@"\r\n"];
+        [self.writeBuffers addObject:[response dataUsingEncoding:NSASCIIStringEncoding]];
+    }
+    self.doClose = YES;
+}
+
+- (void)sendWebSocketResponse
+{
+    DEBUG_LOG(@"sendWebSocketResponse");
     
     NSMutableString *response = [NSMutableString string];
     
-    [response appendString:@"HTTP/1.0 200 OK\r\n"];
-    [response appendString:@"Connection: keep-alive\r\n"];
-    [response appendFormat:@"Content-Length: %lu\r\n", (unsigned long)data.length];
+    NSString *keyStr = [self.webSocketKey stringByAppendingString:MAGIC_STRING];
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    NSData *stringBytes = [keyStr dataUsingEncoding: NSUTF8StringEncoding];
+    if (!CC_SHA1([stringBytes bytes], [stringBytes length], digest)) {
+        abort();
+    }
+    NSData *data = [NSData dataWithBytes:digest length:CC_SHA1_DIGEST_LENGTH];
+    NSString *webSocketAccept = [data base64EncodedStringWithOptions:NSDataBase64EncodingEndLineWithLineFeed];
+    
+    [response appendString:@"HTTP/1.1 101 Switching Protocols\r\n"];
+    [response appendString:@"Upgrade: websocket\r\n"];
+    [response appendString:@"Connection: Upgrade\r\n"];
+    [response appendString:[NSString stringWithFormat:@"Sec-WebSocket-Accept: %@\r\n", webSocketAccept]];
+    [response appendString:@"Access-Control-Allow-Origin: http://localhost:8080\r\n"];
     [response appendString:@"\r\n"];
 
-    if (!USE_PERSISTENT_CONNECTION) {
-        self.doClose = YES;
-    }
     [self.writeBuffers addObject:[response dataUsingEncoding:NSASCIIStringEncoding]];
-    [self.writeBuffers addObject:data];
 }
 
 @end

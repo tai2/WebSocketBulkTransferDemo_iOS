@@ -460,6 +460,7 @@
 				3D9C02B01966A80900DFFE99 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
 		};
 		3D9C02B11966A80900DFFE99 /* Build configuration list for PBXNativeTarget "WebSocketBulkTrasferDemoTests" */ = {
 			isa = XCConfigurationList;
@@ -468,6 +469,7 @@
 				3D9C02B31966A80900DFFE99 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 	};
