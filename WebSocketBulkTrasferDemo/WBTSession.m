@@ -10,10 +10,11 @@
 #include <sys/socket.h>
 #include <CommonCrypto/CommonDigest.h>
 
-#define CHUNK_SIZE (128 * 1024)
+#define PAYLOAD_LEN (1024 * 1024)
 #define SEND_BUFFER_SIZE (1024 * 1024)
+#define WRITE_BUFFER_LIMIT (1024 * 1024 * 10)
 
-#define ENABLE_LOG
+//#define ENABLE_LOG
 
 #ifdef ENABLE_LOG
 #define DEBUG_LOG(...) NSLog(__VA_ARGS__)
@@ -32,12 +33,14 @@
 @property (retain, nonatomic) NSMutableData *lineBuffer;
 @property (assign, nonatomic) int linePos;
 @property (retain, nonatomic) NSMutableArray *writeBuffers;
+@property (assign, nonatomic) NSInteger writeBufferUsed;
 @property (assign, nonatomic) NSInteger writePos;
 @property (assign, nonatomic) BOOL doClose;
 @property (assign, nonatomic) BOOL requestLineReceived;
 @property (retain, nonatomic) NSString *webSocketKey;
 @property (retain, nonatomic) NSString *path;
 @property (assign, nonatomic) BOOL isWebSocket;
+@property (assign, nonatomic) BOOL isHandshakeCompelete;
 
 @end
 
@@ -77,8 +80,9 @@
     session.receiveBuffer = [NSMutableData dataWithLength:RECV_BUFF_SIZE];
     session.lineBuffer = [NSMutableData dataWithLength:LINE_SIZE];
     session.linePos = 0;
-    session.writePos = 0;
     session.writeBuffers = [NSMutableArray array];
+    session.writeBufferUsed = 0;
+    session.writePos = 0;
     session.doClose = NO;
 
     session.inputStream = inputStream;
@@ -92,8 +96,9 @@
     [session.outputStream open];
     
     session.requestLineReceived = NO;
-    session.isWebSocket = NO;
     session.path = nil;
+    session.isWebSocket = NO;
+    session.isHandshakeCompelete = NO;
     session.webSocketKey = nil;
     
     return session;
@@ -182,6 +187,10 @@
 
 - (BOOL)consume:(NSInteger)bytesReceived
 {
+    if (self.isWebSocket && self.isHandshakeCompelete) {
+        return YES;
+    }
+    
     for (int i = 0; i < bytesReceived; i++) {
         char c = ((char *)self.receiveBuffer.bytes)[i];
         switch (c) {
@@ -198,6 +207,8 @@
                 } else {
                     if (self.isWebSocket) {
                         [self sendWebSocketResponse];
+                        [self fillBuffer];
+                        self.isHandshakeCompelete = YES;
                     } else {
                         [self sendFileResponse];
                     }
@@ -244,6 +255,19 @@
     }
 }
 
+- (void)enqueueData:(NSData *)data
+{
+    [self.writeBuffers addObject:data];
+    self.writeBufferUsed += data.length;
+}
+
+- (void)dequeueData
+{
+    NSData *data = self.writeBuffers.firstObject;
+    [self.writeBuffers removeObjectAtIndex:0];
+    self.writeBufferUsed -= data.length;
+}
+
 - (void)flush
 {
     DEBUG_LOG(@"flush");
@@ -258,7 +282,7 @@
         if (len > 0) {
             self.writePos += len;
             if (self.writePos == data.length) {
-                [self.writeBuffers removeObjectAtIndex:0];
+                [self dequeueData];
                 self.writePos = 0;
             } else {
                 break;
@@ -291,15 +315,15 @@
         [response appendString:@"Connection: close\r\n"];
         [response appendFormat:@"Content-Length: %lu\r\n", (unsigned long)data.length];
         [response appendString:@"\r\n"];
-        [self.writeBuffers addObject:[response dataUsingEncoding:NSASCIIStringEncoding]];
-        [self.writeBuffers addObject:data];
+        [self enqueueData:[response dataUsingEncoding:NSASCIIStringEncoding]];
+        [self enqueueData:data];
     } else {
         NSMutableString *response = [NSMutableString string];
         [response appendString:@"HTTP/1.1 404 Not Found\r\n"];
         [response appendString:@"Connection: close\r\n"];
         [response appendFormat:@"Content-Length: 0\r\n"];
         [response appendString:@"\r\n"];
-        [self.writeBuffers addObject:[response dataUsingEncoding:NSASCIIStringEncoding]];
+        [self enqueueData:[response dataUsingEncoding:NSASCIIStringEncoding]];
     }
     self.doClose = YES;
 }
@@ -313,7 +337,7 @@
     NSString *keyStr = [self.webSocketKey stringByAppendingString:MAGIC_STRING];
     unsigned char digest[CC_SHA1_DIGEST_LENGTH];
     NSData *stringBytes = [keyStr dataUsingEncoding: NSUTF8StringEncoding];
-    if (!CC_SHA1([stringBytes bytes], [stringBytes length], digest)) {
+    if (!CC_SHA1([stringBytes bytes], (CC_LONG)[stringBytes length], digest)) {
         abort();
     }
     NSData *data = [NSData dataWithBytes:digest length:CC_SHA1_DIGEST_LENGTH];
@@ -326,7 +350,45 @@
     [response appendString:@"Access-Control-Allow-Origin: http://localhost:8080\r\n"];
     [response appendString:@"\r\n"];
 
-    [self.writeBuffers addObject:[response dataUsingEncoding:NSASCIIStringEncoding]];
+    [self enqueueData:[response dataUsingEncoding:NSASCIIStringEncoding]];
+}
+
+- (void)sendPacket
+{    
+    BOOL fin = YES;
+    NSUInteger payloadLen = PAYLOAD_LEN;
+    NSInteger opcode = 0x02; // binary
+    NSInteger len1 = 127;
+    BOOL mask = NO;
+    NSMutableData *header = [NSMutableData dataWithLength:10];
+    unsigned char *data = (unsigned char *)[header bytes];
+    data[0] = (fin ? 0x80 : 0x00) | (opcode & 0x0f);
+    data[1] = (mask ? 0x80 : 0x00) | (len1 & 0x7f);
+    data[2] = 0;
+    data[3] = 0;
+    data[4] = 0;
+    data[5] = 0;
+    data[6] = (payloadLen>>24) & 0xFF;
+    data[7] = (payloadLen>>16) & 0xFF;
+    data[8] = (payloadLen>> 8) & 0xFF;
+    data[9] = (payloadLen>> 0) & 0xFF;
+    [self enqueueData:header];
+    
+    NSMutableData *payload = [NSMutableData dataWithLength:payloadLen];
+    [self enqueueData:payload];
+}
+
+- (void)fillBuffer
+{
+    DEBUG_LOG(@"fillBuffer bufferUsed=%d", self.writeBufferUsed);
+    
+    while (WRITE_BUFFER_LIMIT > self.writeBufferUsed + 10 + PAYLOAD_LEN) {
+        [self sendPacket];
+    }
+    
+    [self flush];
+    
+    [self performSelector:@selector(fillBuffer) withObject:nil afterDelay:0.1];
 }
 
 @end
